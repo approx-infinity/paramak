@@ -1,6 +1,9 @@
+from collections import Counter
 from typing import Sequence, Tuple
 
 import cadquery as cq
+import numpy as np
+import warnings
 from .assembly import Assembly
 
 from ..utils import (
@@ -11,10 +14,212 @@ from ..utils import (
     validate_unique_assembly_names, 
     LayerType
 )
-from ..workplanes.blanket_from_plasma import blanket_from_plasma
+from ..workplanes.blanket_from_plasma import blanket_from_plasma, create_offset_points
 from ..workplanes.center_column_shield_cylinder import center_column_shield_cylinder
 from ..workplanes.plasma_simplified import plasma_simplified
 from .spherical_tokamak import get_plasma_value, sum_up_to_plasma
+
+
+_POLOIDAL_ARC_LENGTH_NUM_POINTS = 720
+
+
+def _as_offset_list(offsets):
+    if isinstance(offsets, (list, tuple)):
+        return list(offsets), True
+    return [offsets], False
+
+
+def _poloidal_arc_length_profile(
+    offset,
+    major_radius,
+    minor_radius,
+    triangularity,
+    elongation,
+    num_points=_POLOIDAL_ARC_LENGTH_NUM_POINTS,
+):
+    thetas = np.linspace(0.0, 360.0, num=num_points, endpoint=True)
+    points, overlapping_shape = create_offset_points(
+        major_radius=major_radius,
+        minor_radius=minor_radius,
+        triangularity=triangularity,
+        elongation=elongation,
+        vertical_displacement=0.0,
+        thetas=thetas,
+        offset=lambda theta: offset,
+    )
+
+    if overlapping_shape:
+        raise ValueError(
+            f"poloidal_arc_length cannot be computed for offset {offset} because the resulting shape has negative R coordinates."
+        )
+
+    if len(points) != len(thetas):
+        raise ValueError(
+            f"poloidal_arc_length requires a non-overlapping closed loop; received {len(points)} points for {len(thetas)} angles."
+        )
+
+    coordinates = np.asarray([(point[0], point[1]) for point in points], dtype=float)
+    segment_lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
+    cumulative_lengths = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+    return thetas, cumulative_lengths
+
+
+def poloidal_arc_length(
+    offsets,
+    major_radius,
+    minor_radius,
+    triangularity,
+    elongation,
+    num_points=_POLOIDAL_ARC_LENGTH_NUM_POINTS,
+):
+    """Return the poloidal arc length at one or more offsets from the plasma surface."""
+
+    offsets_list, is_sequence = _as_offset_list(offsets)
+    arc_lengths = []
+    for offset in offsets_list:
+        _, cumulative_lengths = _poloidal_arc_length_profile(
+            offset=offset,
+            major_radius=major_radius,
+            minor_radius=minor_radius,
+            triangularity=triangularity,
+            elongation=elongation,
+            num_points=num_points,
+        )
+        arc_lengths.append(float(cumulative_lengths[-1]))
+
+    return arc_lengths if is_sequence else arc_lengths[0]
+
+
+def _validate_poloidal_build(radial_build, poloidal_build):
+    if poloidal_build is None:
+        return
+
+    plasma_index = get_plasma_index(radial_build)
+    expected_length = len(radial_build) - plasma_index - 1
+    if len(poloidal_build) != expected_length:
+        raise ValueError(
+            f"poloidal_build must contain {expected_length} entries for tokamak_from_plasma(), one for each radial pair after the plasma entry, not {len(poloidal_build)}."
+        )
+
+
+def _segment_name(layer_name, segment_name, segment_counts, segment_index):
+    if segment_counts[segment_name] > 1:
+        return f"{layer_name}_{segment_name}_{segment_index}"
+    return f"{layer_name}_{segment_name}"
+
+
+def _create_segmented_layer(
+    layer_name,
+    segment_build,
+    minor_radius,
+    major_radius,
+    triangularity,
+    elongation,
+    rotation_angle,
+    inner_offset,
+    upper_layer_thickness,
+    lower_layer_thickness,
+    inner_layer_thickness,
+    outer_layer_thickness,
+    cumulative_thickness_uvb,
+    cumulative_thickness_lvb,
+    cumulative_thickness_irb,
+    cumulative_thickness_orb,
+):
+    segment_counts = Counter(name for name, thickness in segment_build if name != "gap")
+    segment_occurrence_counts = Counter()
+
+    segment_start_lengths = [0.0]
+    for _, thickness in segment_build:
+        if thickness <= 0:
+            raise ValueError(f"poloidal_build entries must have positive lengths, not {thickness}.")
+        segment_start_lengths.append(segment_start_lengths[-1] + thickness)
+
+    total_arc_length = segment_start_lengths[-1]
+    thetas, cumulative_lengths = _poloidal_arc_length_profile(
+        offset=inner_offset,
+        major_radius=major_radius,
+        minor_radius=minor_radius,
+        triangularity=triangularity,
+        elongation=elongation,
+    )
+
+    actual_arc_length = float(cumulative_lengths[-1])
+    if abs(total_arc_length - actual_arc_length) > 1e-3:
+        raise ValueError(
+            f"poloidal_build for {layer_name} sums to {total_arc_length} mm, but the arc length at the layer's inner surface (offset {inner_offset}) is {actual_arc_length:.6f} mm."
+        )
+
+    layers = []
+
+    def thickness_profile(theta):
+        theta = theta % 360.0
+        return float(
+            np.interp(
+                theta,
+                [0.0, 90.0, 180.0, 270.0, 360.0],
+                [
+                    outer_layer_thickness,
+                    upper_layer_thickness,
+                    inner_layer_thickness,
+                    lower_layer_thickness,
+                    outer_layer_thickness,
+                ],
+            )
+        )
+
+    def offset_profile(theta):
+        theta = theta % 360.0
+        return float(
+            np.interp(
+                theta,
+                [0.0, 90.0, 180.0, 270.0, 360.0],
+                [
+                    cumulative_thickness_orb,
+                    cumulative_thickness_uvb,
+                    cumulative_thickness_irb,
+                    cumulative_thickness_lvb,
+                    cumulative_thickness_orb,
+                ],
+            )
+        )
+
+    for segment_index, (segment_name, segment_length) in enumerate(segment_build):
+        start_length = segment_start_lengths[segment_index]
+        stop_length = segment_start_lengths[segment_index + 1]
+
+        if segment_name == "gap":
+            continue
+
+        segment_occurrence_counts[segment_name] += 1
+        name = _segment_name(
+            layer_name=layer_name,
+            segment_name=segment_name,
+            segment_counts=segment_counts,
+            segment_index=segment_occurrence_counts[segment_name],
+        )
+
+        start_angle = float(np.interp(start_length, cumulative_lengths, thetas))
+        stop_angle = float(np.interp(stop_length, cumulative_lengths, thetas))
+
+        segment = blanket_from_plasma(
+            minor_radius=minor_radius,
+            major_radius=major_radius,
+            triangularity=triangularity,
+            elongation=elongation,
+            thickness=thickness_profile,
+            offset_from_plasma=offset_profile,
+            start_angle=start_angle,
+            stop_angle=stop_angle,
+            rotation_angle=rotation_angle,
+            color=(0.5, 0.5, 0.5),
+            name=name,
+            allow_overlapping_shape=True,
+        )
+        segment.name = name
+        layers.append(segment)
+
+    return layers
 
 
 def count_cylinder_layers(radial_build):
@@ -79,13 +284,30 @@ def distance_to_plasma(radial_build, index):
 
 
 def create_layers_from_plasma(
-    radial_build, vertical_build, minor_radius, major_radius, triangularity, elongation, rotation_angle, center_column, layer_count=0
+    radial_build,
+    vertical_build,
+    minor_radius,
+    major_radius,
+    triangularity,
+    elongation,
+    rotation_angle,
+    center_column,
+    poloidal_build=None,
+    layer_count=0,
 ):
 
     plasma_index_rb = get_plasma_index(radial_build)
     plasma_index_vb = get_plasma_index(vertical_build)
     indexes_from_plasma_to_end = len(radial_build) - plasma_index_rb
     layers = []
+
+    _validate_poloidal_build(radial_build, poloidal_build)
+    if poloidal_build is not None:
+        warnings.warn(
+            "poloidal_build provided: segment lengths are measured along the layer inner surface; "
+            "the inner arc is not automatically added. GAP entries must have a corresponding None in poloidal_build.",
+            UserWarning,
+        )
 
     cumulative_thickness_orb = 0
     cumulative_thickness_irb = 0
@@ -100,8 +322,15 @@ def create_layers_from_plasma(
         inner_layer_thickness = radial_build[plasma_index_rb - index_delta][1]
         upper_layer_thickness = vertical_build[plasma_index_vb - index_delta][1]
         lower_layer_thickness = vertical_build[plasma_index_vb + index_delta][1]
+        poloidal_entry = None
+        if poloidal_build is not None and index_delta > 0:
+            poloidal_entry = poloidal_build[index_delta - 1]
 
         if radial_build[plasma_index_rb + index_delta][0] == LayerType.GAP:
+            if poloidal_entry is not None:
+                raise ValueError(
+                    f"poloidal_build entries corresponding to GAP layers must be None; received {poloidal_entry} for radial layer index {index_delta}."
+                )
             cumulative_thickness_orb += outer_layer_thickness
             cumulative_thickness_irb += inner_layer_thickness
             cumulative_thickness_uvb += upper_layer_thickness
@@ -118,46 +347,67 @@ def create_layers_from_plasma(
 
         # build outer layer
         if radial_build[plasma_index_rb + index_delta][0] == LayerType.SOLID:
-            outer_layer = blanket_from_plasma(
-                minor_radius=minor_radius,
-                major_radius=major_radius,
-                triangularity=triangularity,
-                elongation=elongation,
-                thickness=[upper_layer_thickness, outer_layer_thickness, lower_layer_thickness],
-                offset_from_plasma=[cumulative_thickness_uvb, cumulative_thickness_orb, cumulative_thickness_lvb],
-                start_angle=90,
-                stop_angle=-90,
-                rotation_angle=rotation_angle,
-                color=(0.5, 0.5, 0.5),
-                name=layer_name,
-                allow_overlapping_shape=True,
-            )
-            inner_layer = blanket_from_plasma(
-                minor_radius=minor_radius,
-                major_radius=major_radius,
-                triangularity=triangularity,
-                elongation=elongation,
-                thickness=[
-                    lower_layer_thickness,
-                    inner_layer_thickness,
-                    upper_layer_thickness,
-                ],
-                offset_from_plasma=[
-                    cumulative_thickness_lvb,
-                    cumulative_thickness_irb,
-                    cumulative_thickness_uvb,
-                ],
-                start_angle=-90,
-                stop_angle=-270,
-                rotation_angle=rotation_angle,
-                color=(0.5, 0.5, 0.5),
-                name=layer_name,
-                allow_overlapping_shape=True,
-            )
-            layer = outer_layer.union(inner_layer)
-            layer.name = layer_name
-            layers.append(layer)
-            # layers.append(inner_layer)
+            if poloidal_entry is None:
+                outer_layer = blanket_from_plasma(
+                    minor_radius=minor_radius,
+                    major_radius=major_radius,
+                    triangularity=triangularity,
+                    elongation=elongation,
+                    thickness=[upper_layer_thickness, outer_layer_thickness, lower_layer_thickness],
+                    offset_from_plasma=[cumulative_thickness_uvb, cumulative_thickness_orb, cumulative_thickness_lvb],
+                    start_angle=90,
+                    stop_angle=-90,
+                    rotation_angle=rotation_angle,
+                    color=(0.5, 0.5, 0.5),
+                    name=layer_name,
+                    allow_overlapping_shape=True,
+                )
+                inner_layer = blanket_from_plasma(
+                    minor_radius=minor_radius,
+                    major_radius=major_radius,
+                    triangularity=triangularity,
+                    elongation=elongation,
+                    thickness=[
+                        lower_layer_thickness,
+                        inner_layer_thickness,
+                        upper_layer_thickness,
+                    ],
+                    offset_from_plasma=[
+                        cumulative_thickness_lvb,
+                        cumulative_thickness_irb,
+                        cumulative_thickness_uvb,
+                    ],
+                    start_angle=-90,
+                    stop_angle=-270,
+                    rotation_angle=rotation_angle,
+                    color=(0.5, 0.5, 0.5),
+                    name=layer_name,
+                    allow_overlapping_shape=True,
+                )
+                layer = outer_layer.union(inner_layer)
+                layer.name = layer_name
+                layers.append(layer)
+            else:
+                layers.extend(
+                    _create_segmented_layer(
+                        layer_name=layer_name,
+                        segment_build=poloidal_entry,
+                        minor_radius=minor_radius,
+                        major_radius=major_radius,
+                        triangularity=triangularity,
+                        elongation=elongation,
+                        rotation_angle=rotation_angle,
+                        inner_offset=cumulative_thickness_orb,
+                        upper_layer_thickness=upper_layer_thickness,
+                        lower_layer_thickness=lower_layer_thickness,
+                        inner_layer_thickness=inner_layer_thickness,
+                        outer_layer_thickness=outer_layer_thickness,
+                        cumulative_thickness_uvb=cumulative_thickness_uvb,
+                        cumulative_thickness_lvb=cumulative_thickness_lvb,
+                        cumulative_thickness_irb=cumulative_thickness_irb,
+                        cumulative_thickness_orb=cumulative_thickness_orb,
+                    )
+                )
         cumulative_thickness_orb += outer_layer_thickness
         cumulative_thickness_irb += inner_layer_thickness
         cumulative_thickness_uvb += upper_layer_thickness
@@ -171,6 +421,7 @@ def create_layers_from_plasma(
 
 def tokamak_from_plasma(
     radial_build: Sequence[Tuple[LayerType, float] | Tuple[LayerType, float, str]],
+    poloidal_build=None,
     elongation: float = 2.0,
     triangularity: float = 0.55,
     rotation_angle: float = 180.0,
@@ -184,6 +435,12 @@ def tokamak_from_plasma(
     Args:
         radial_build: sequence of tuples containing the radial build of the
             reactor. Each tuple should contain a LayerType, a float and a string.
+        poloidal_build: optional sequence of poloidal segment definitions, one
+            per radial pair after the plasma entry. Entries corresponding to
+            GAP layers must be `None` in the corresponding slot of
+            `poloidal_build`. Segment lengths are measured along the layer
+            inner surface (at the cumulative outer radial offset); the inner
+            arc is not automatically added.
         elongation: The elongation of the plasma. Defaults to 2.0.
         triangularity: The triangularity of the plasma. Defaults to 0.55.
         rotation_angle: The rotation angle of the plasma. Defaults to 180.0.
@@ -227,6 +484,7 @@ def tokamak_from_plasma(
 
     return tokamak(
         radial_build=radial_build,
+        poloidal_build=poloidal_build,
         vertical_build=vertical_build,
         triangularity=triangularity,
         rotation_angle=rotation_angle,
@@ -239,6 +497,7 @@ def tokamak_from_plasma(
 def tokamak(
     radial_build: Sequence[Tuple[str, float] | Tuple[str, float, str]],
     vertical_build: Sequence[Tuple[str, float] | Tuple[str, float, str]],
+    poloidal_build=None,
     triangularity: float = 0.55,
     rotation_angle: float = 180.0,
     extra_cut_shapes: Sequence[cq.Workplane] = None,
@@ -253,6 +512,10 @@ def tokamak(
             reactor. Each tuple should contain a LayerType, a float and the string is optional.
         vertical_build: sequence of tuples containing the vertical build of the
             reactor. Each tuple should contain a LayerType, a float and the string is optional.
+        poloidal_build: optional sequence of poloidal segment definitions, one per radial pair after
+            the plasma entry. Entries corresponding to GAP layers must be `None` in the corresponding slot of `poloidal_build`. 
+            Segment lengths are measured along the layer inner surface (at the cumulative outer radial offset);
+            the inner arc is not automatically added.
         triangularity: The triangularity of the plasma. Defaults to 0.55.
         rotation_angle: The rotation angle of the plasma. Defaults to 180.0.
         extra_cut_shapes: A list of extra shapes to cut the reactor with. Defaults to [].
@@ -298,6 +561,8 @@ def tokamak(
         radial_build, rotation_angle, blanket_rear_wall_end_height
     )
 
+    blanket_cutting_cylinder = inner_radial_build[0] if inner_radial_build else None
+
     blanket_layers = create_layers_from_plasma(
         radial_build=radial_build,
         vertical_build=vertical_build,
@@ -306,7 +571,8 @@ def tokamak(
         triangularity=triangularity,
         elongation=elongation,
         rotation_angle=rotation_angle,
-        center_column=inner_radial_build[0],  # blanket_cutting_cylinder,
+        center_column=blanket_cutting_cylinder,
+        poloidal_build=poloidal_build,
         layer_count=len(inner_radial_build)
     )
 
@@ -326,8 +592,16 @@ def tokamak(
     # builds up the intersect shapes
     if len(extra_intersect_shapes) > 0:
         # makes a union of the the radial build to use as a base for the intersect shapes
-        reactor_compound = inner_radial_build[0]
-        for entry in inner_radial_build[1:] + blanket_layers:
+        if inner_radial_build:
+            reactor_compound = inner_radial_build[0]
+            compound_entries = inner_radial_build[1:] + blanket_layers
+        elif blanket_layers:
+            reactor_compound = blanket_layers[0]
+            compound_entries = blanket_layers[1:]
+        else:
+            raise ValueError("tokamak() requires at least one solid layer to build a reactor compound.")
+
+        for entry in compound_entries:
             reactor_compound = reactor_compound.union(entry)
 
         # adds the extra intersect shapes to the assembly

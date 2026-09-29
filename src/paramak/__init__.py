@@ -18,6 +18,7 @@ from .workplanes.u_shaped_dome import u_shaped_dome
 from .workplanes.toroidal_field_coil_princeton_d import toroidal_field_coil_princeton_d
 
 from .utils import LayerType
+from .assemblies.tokamak import poloidal_arc_length
 
 __version__ = version("paramak")
 
@@ -34,6 +35,7 @@ __all__ = [
     "plasma_simplified",
     "poloidal_field_coil",
     "poloidal_field_coil_case",
+    "poloidal_arc_length",
     "revolved_shape",
     "spherical_tokamak",
     "spherical_tokamak_from_plasma",

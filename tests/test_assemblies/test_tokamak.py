@@ -1,3 +1,5 @@
+import pytest
+
 import paramak
 
 
@@ -115,3 +117,155 @@ def test_named_layers_tokamak():
         .rename("layer_3", "blanket")
     )
     assert renamed.names() == ["central column", "first wall", "blanket", "plasma"]
+
+
+def test_poloidal_arc_length_and_segmentation():
+    helper_arc_lengths = paramak.poloidal_arc_length(
+        offsets=[0, 10],
+        major_radius=450,
+        minor_radius=150,
+        triangularity=0.55,
+        elongation=2.0,
+    )
+
+    assert isinstance(helper_arc_lengths, list)
+    assert len(helper_arc_lengths) == 2
+    assert helper_arc_lengths[0] > 0
+    assert helper_arc_lengths[1] > helper_arc_lengths[0]
+
+    reactor_arc_length = paramak.poloidal_arc_length(
+        offsets=0,
+        major_radius=180,
+        minor_radius=150,
+        triangularity=0.55,
+        elongation=2.0,
+    )
+
+    reactor = paramak.tokamak_from_plasma(
+        radial_build=[
+            (paramak.LayerType.GAP, 10),
+            (paramak.LayerType.SOLID, 20),
+            (paramak.LayerType.PLASMA, 300),
+            (paramak.LayerType.SOLID, 20),
+            (paramak.LayerType.GAP, 10),
+        ],
+        poloidal_build=[
+            [
+                    ("outboard", reactor_arc_length / 2),
+                    ("inboard", reactor_arc_length / 2),
+            ],
+            None,
+        ],
+        elongation=2.0,
+        triangularity=0.55,
+        rotation_angle=180,
+    )
+
+    assert reactor.names() == ["layer_1_outboard", "layer_1_inboard", "plasma"]
+
+
+def test_poloidal_build_validation():
+    arc_length_at_reactor = paramak.poloidal_arc_length(
+        offsets=0,
+        major_radius=180,
+        minor_radius=150,
+        triangularity=0.55,
+        elongation=2.0,
+    )
+
+    with pytest.raises(ValueError, match="poloidal_build must contain"):
+        paramak.tokamak_from_plasma(
+            radial_build=[
+                (paramak.LayerType.GAP, 10),
+                (paramak.LayerType.SOLID, 20),
+                (paramak.LayerType.PLASMA, 300),
+                (paramak.LayerType.SOLID, 20),
+                (paramak.LayerType.GAP, 10),
+            ],
+            poloidal_build=[[("outboard", 1.0)]],
+            rotation_angle=180,
+        )
+
+    with pytest.raises(ValueError, match="poloidal_build must be None for GAP entries"):
+        paramak.tokamak_from_plasma(
+            radial_build=[
+                (paramak.LayerType.GAP, 10),
+                (paramak.LayerType.SOLID, 20),
+                (paramak.LayerType.PLASMA, 300),
+                (paramak.LayerType.SOLID, 20),
+                (paramak.LayerType.GAP, 10),
+            ],
+            poloidal_build=[
+                [("outboard", arc_length_at_reactor / 2), ("gap", 0.0), ("inboard", arc_length_at_reactor / 2)],
+                [("gap", 0.0)],
+            ],
+            rotation_angle=180,
+        )
+
+
+def test_multi_layer_poloidal_segmentation():
+    radial_build = [
+        (paramak.LayerType.GAP, 10),
+        (paramak.LayerType.SOLID, 20, "blanket"),
+        (paramak.LayerType.SOLID, 10, "first wall"),
+        (paramak.LayerType.GAP, 40),
+        (paramak.LayerType.PLASMA, 300),
+        (paramak.LayerType.GAP, 40),
+        (paramak.LayerType.SOLID, 10),
+        (paramak.LayerType.SOLID, 20),
+        (paramak.LayerType.GAP, 10),
+    ]
+
+    base = paramak.tokamak_from_plasma(
+        radial_build=radial_build,
+        elongation=2.0,
+        triangularity=0.55,
+        rotation_angle=180,
+    )
+
+    arcs = paramak.poloidal_arc_length(
+        offsets=[40, 50],
+        major_radius=base.major_radius,
+        minor_radius=base.minor_radius,
+        triangularity=0.55,
+        elongation=2.0,
+    )
+
+    gap_mm = 50.0
+    first_wall_total = arcs[0] - 2 * gap_mm
+    blanket_total = arcs[1] - 2 * gap_mm
+
+    segmented = paramak.tokamak_from_plasma(
+        radial_build=radial_build,
+        poloidal_build=[
+            None,
+            [
+                ("outboard", first_wall_total * 0.2),
+                ("gap", gap_mm),
+                ("inboard", first_wall_total * 0.6),
+                ("gap", gap_mm),
+                ("outboard", first_wall_total * 0.2),
+            ],
+            [
+                ("outboard", blanket_total * 0.2),
+                ("gap", gap_mm),
+                ("inboard", blanket_total * 0.6),
+                ("gap", gap_mm),
+                ("outboard", blanket_total * 0.2),
+            ],
+            None,
+        ],
+        elongation=2.0,
+        triangularity=0.55,
+        rotation_angle=180,
+    )
+
+    assert segmented.names() == [
+        "first wall_outboard_1",
+        "first wall_inboard",
+        "first wall_outboard_2",
+        "blanket_outboard_1",
+        "blanket_inboard",
+        "blanket_outboard_2",
+        "plasma",
+    ]
