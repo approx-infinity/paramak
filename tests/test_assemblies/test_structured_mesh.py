@@ -668,7 +668,41 @@ def test_divertor_mesh_handles_crossing_inboard_and_outboard_interfaces():
         "lower_divertor_armor",
         "lower_divertor_heatsink",
         "lower_divertor_shield",
+        "armor_inboard",
+        "armor_outboard",
     }
+
+
+def test_toroidal_sector_mesh_names_preserve_split_inboard_outboard_parts(monkeypatch):
+    assembly = Assembly()
+    part_names = [
+        f"armor_sector_{sector}_{side}"
+        for sector in (1, 2)
+        for side in ("inboard", "outboard")
+    ]
+    monkeypatch.setattr(assembly, "names", lambda: part_names)
+    meshes = []
+    for sector in (1, 2):
+        inboard = sample_tetrahedron_mesh(f"armor_sector_{sector}")
+        inboard["vertices"] += np.array([3.0, 0.0, 0.0])
+        outboard = sample_tetrahedron_mesh(f"armor_sector_{sector}")
+        outboard["vertices"] += np.array([12.0, 0.0, 0.0])
+        meshes.extend((inboard, outboard))
+
+    data = {
+        "divertors": [{}],
+        "layer_pairs": [{"name": "armor", "type": paramak.LayerType.SOLID}],
+        "solid_type": paramak.LayerType.SOLID,
+        "major_radius": 10.0,
+    }
+    named_meshes = assembly._name_split_blanket_meshes(meshes, data)
+
+    assert sorted(mesh["name"] for mesh in named_meshes) == [
+        "armor_inboard_sector_1",
+        "armor_inboard_sector_2",
+        "armor_outboard_sector_1",
+        "armor_outboard_sector_2",
+    ]
 
 
 def test_assembly_dagmc_and_exodus_methods_delegate_to_mesh_converters(monkeypatch, partial_tokamak, tmp_path):

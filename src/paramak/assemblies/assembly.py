@@ -104,6 +104,51 @@ class Assembly(cq.Assembly):
             for solid in solids
         ]
 
+    def _name_split_blanket_meshes(self, meshes, data):
+        """Name disconnected inboard/outboard blanket mesh components."""
+        if not data.get("divertors"):
+            return meshes
+
+        blanket_names = {
+            pair["name"]
+            for pair in data["layer_pairs"]
+            if pair["type"] == data["solid_type"] and pair["name"] is not None
+        }
+        assembly_names = set(self.names())
+        split_mesh_names = {}
+        for layer_name in blanket_names:
+            candidate_names = set()
+            for mesh in meshes:
+                mesh_name = mesh.get("name")
+                if isinstance(mesh_name, str) and (
+                    mesh_name == layer_name or mesh_name.startswith(f"{layer_name}_")
+                ):
+                    candidate_names.add(mesh_name)
+            for mesh_name in candidate_names:
+                if f"{mesh_name}_inboard" in assembly_names and f"{mesh_name}_outboard" in assembly_names:
+                    split_mesh_names[mesh_name] = layer_name
+        meshes_by_name = {}
+        for mesh_index, mesh in enumerate(meshes):
+            mesh_name = mesh.get("name")
+            if mesh_name in split_mesh_names:
+                vertices = np.asarray(mesh["vertices"])
+                mean_radius = np.mean(np.hypot(vertices[:, 0], vertices[:, 1]))
+                meshes_by_name.setdefault(mesh_name, []).append((mesh_index, mean_radius))
+
+        major_radius = data["major_radius"]
+        for mesh_name, components in meshes_by_name.items():
+            inboard = [(index, radius) for index, radius in components if radius < major_radius]
+            outboard = [(index, radius) for index, radius in components if radius > major_radius]
+            if not inboard or not outboard:
+                continue
+            layer_name = split_mesh_names[mesh_name]
+            segment_suffix = mesh_name[len(layer_name) :]
+            for index, _ in inboard:
+                meshes[index]["name"] = f"{layer_name}_inboard{segment_suffix}"
+            for index, _ in outboard:
+                meshes[index]["name"] = f"{layer_name}_outboard{segment_suffix}"
+        return meshes
+
     def mesh_structured_layers(
         self,
         n_poloidal=128,
@@ -142,7 +187,7 @@ class Assembly(cq.Assembly):
         """
         if self.structured_layer_data is None:
             raise ValueError(
-                "Structured meshing requires a generated tokamak model without geometry-altering CAD cuts."
+                "Structured meshing requires a generated tokamak model with layer metadata."
             )
         if not isinstance(n_poloidal, int) or n_poloidal < 3:
             raise ValueError("n_poloidal must be an integer of at least 3")
@@ -157,8 +202,13 @@ class Assembly(cq.Assembly):
         if not np.isfinite(coil_angular_tolerance) or coil_angular_tolerance <= 0:
             raise ValueError("coil_angular_tolerance must be finite and positive")
 
-        if self.structured_layer_data.get("divertors") or any(
-            sector_list is not None for sector_list in self.structured_layer_data.get("toroidal_sectors", ())
+        if (
+            self.structured_layer_data.get("divertors")
+            or self.structured_layer_data.get("poloidal_cuts")
+            or any(
+                sector_list is not None
+                for sector_list in self.structured_layer_data.get("toroidal_sectors", ())
+            )
         ):
             from ..workplanes.structured_mesh import surface_meshes_from_tetrahedral_meshes
 
@@ -263,25 +313,84 @@ class Assembly(cq.Assembly):
         coil_tolerance=0.5,
         coil_angular_tolerance=0.1,
         tag_names=None,
+        n_radial=1,
+        include_added_components=True,
+        coil_mesh_size=10.0,
+        volume_meshes=None,
     ):
-        """Create a DAGMC model from this tokamak's structured blanket meshes.
+        """Create a DAGMC model from tetrahedral meshes of assembly solids.
 
         The returned model can be saved with ``model.write_file("model.h5m")``.
-        It includes generated blanket, divertor, center-column, and added CAD
-        component surfaces such as coils. The mesh does not include the plasma.
-        ``tag_names`` maps generated mesh names to H5M material tag names
-        (without the ``mat:`` prefix). Multiple mesh names can map to one tag.
-        """
-        from ..workplanes.structured_mesh import dagmc_model_from_structured_meshes
+        Every solid is tetrahedralized first; its exterior faces are then used
+        to create the DAGMC surface mesh. The mesh excludes the plasma by
+        default. ``tag_names`` maps mesh names to H5M material names (without
+        the ``mat:`` prefix). Multiple mesh names can map to one tag.
 
-        meshes = self.mesh_structured_layers(
-            n_poloidal=n_poloidal,
-            n_toroidal=n_toroidal,
-            n_axial=n_axial,
-            coil_tolerance=coil_tolerance,
-            coil_angular_tolerance=coil_angular_tolerance,
+        Structured tokamak models are meshed using ``n_poloidal``,
+        ``n_toroidal``, ``n_radial``, and ``n_axial``. Added CAD components
+        such as coils can be tetrahedralized with Gmsh by setting
+        ``include_added_components=True``. Pass ``volume_meshes`` to reuse a
+        mesh for another export, such as Exodus.
+        """
+        from ..workplanes.structured_mesh import (
+            dagmc_model_from_structured_meshes,
+            surface_meshes_from_tetrahedral_meshes,
         )
+
+        if volume_meshes is None:
+            if self.structured_layer_data is None:
+                raise ValueError(
+                    "DAGMC structured export requires generated tokamak layer metadata."
+                )
+            volume_meshes = self.mesh_structured_layer_volumes(
+                n_poloidal=n_poloidal,
+                n_toroidal=n_toroidal,
+                n_radial=n_radial,
+                n_axial=n_axial,
+                include_added_components=include_added_components,
+                coil_mesh_size=coil_mesh_size,
+            )
+        meshes = surface_meshes_from_tetrahedral_meshes(volume_meshes)
         return dagmc_model_from_structured_meshes(meshes, tag_names=tag_names)
+
+    def mesh_cad_layer_volumes(self, mesh_size=10.0, include_plasma=False):
+        """Tetrahedralize the current assembly solids, including CAD cuts.
+
+        Unlike the structured mesh methods, this meshes the actual CAD shapes
+        stored in the assembly and therefore preserves boolean edits such as
+        :meth:`cut_layers`.
+        """
+        from ..workplanes.structured_mesh import tetrahedralize_cad_solid
+
+        meshes = []
+        for obj, full_path, loc, _ in self:
+            name = full_path.split("/")[-1]
+            if name == "plasma" and not include_plasma:
+                continue
+            shape = obj.val() if isinstance(obj, cq.Workplane) else obj
+            if not isinstance(shape, cq.Shape):
+                continue
+            placed_shape = shape.moved(loc)
+            solids = placed_shape.Solids()
+            for index, solid in enumerate(solids):
+                solid_name = name if len(solids) == 1 else f"{name}_{index + 1}"
+                meshes.append(tetrahedralize_cad_solid(solid, solid_name, mesh_size=mesh_size))
+        return meshes
+
+    def export_cad_layers_exodus(self, filename, mesh_size=10.0, tag_names=None, include_plasma=False):
+        """Mesh and export the current CAD assembly to an Exodus file."""
+        from ..workplanes.structured_mesh import (
+            merge_tetrahedral_meshes,
+            remap_mesh_names,
+            write_tetrahedral_mesh_exodus,
+        )
+
+        meshes = remap_mesh_names(
+            self.mesh_cad_layer_volumes(mesh_size=mesh_size, include_plasma=include_plasma),
+            tag_names,
+        )
+        vertices, connectivity, blocks = merge_tetrahedral_meshes(meshes)
+        return write_tetrahedral_mesh_exodus(vertices, connectivity, blocks, filename)
 
     def mesh_structured_layer_volumes(
         self,
@@ -299,7 +408,7 @@ class Assembly(cq.Assembly):
         """
         if self.structured_layer_data is None:
             raise ValueError(
-                "Structured meshing requires a generated tokamak model without geometry-altering CAD cuts."
+                "Structured meshing requires a generated tokamak model with layer metadata."
             )
         if not isinstance(n_poloidal, int) or n_poloidal < 3:
             raise ValueError("n_poloidal must be an integer of at least 3")
@@ -331,14 +440,30 @@ class Assembly(cq.Assembly):
                 boundaries.extend(
                     (start, (start + divertor_record["poloidal_extent_angle"]) % 360.0)
                 )
-        theta = np.unique(np.concatenate((np.linspace(0.0, 360.0, n_poloidal + 1), boundaries)))
+        for cut_record in data.get("poloidal_cuts", ()):
+            start = cut_record["poloidal_start_angle"] % 360.0
+            boundaries.extend(
+                (start, (start + cut_record["poloidal_extent_angle"]) % 360.0)
+            )
+        theta_candidates = np.sort(
+            np.concatenate((np.linspace(0.0, 360.0, n_poloidal + 1), boundaries))
+        )
+        # CAD vertices on neighbouring toroidal sectors can differ by tiny
+        # roundoff amounts. Their calculated cut endpoints should be one
+        # shared poloidal node, not a near-zero-width interval that collapses
+        # into zero-volume tetrahedra.
+        theta = theta_candidates[
+            np.concatenate(([True], np.diff(theta_candidates) > 1e-8))
+        ]
+        theta[0] = 0.0
+        theta[-1] = 360.0
         phi = np.linspace(0.0, rotation_angle, n_toroidal, endpoint=not full_torus)
         meshes = self._mesh_structured_center_column_volumes(data, phi, n_axial, n_radial, full_torus)
         added_component_meshes = (
             self._mesh_added_component_volumes(data, coil_mesh_size) if include_added_components else []
         )
         has_toroidal_sectors = any(sectors is not None for sectors in data.get("toroidal_sectors", ()))
-        if has_toroidal_sectors:
+        if has_toroidal_sectors or data.get("poloidal_cuts"):
             return (
                 meshes
                 + self._mesh_structured_angular_partition(data, theta, phi, n_radial, full_torus)
@@ -372,8 +497,8 @@ class Assembly(cq.Assembly):
             if segment_list is not None:
                 segment_ranges = []
                 for segment_name, start, stop in segment_list:
-                    start_index = int(np.flatnonzero(np.isclose(theta, start, atol=1e-10))[0])
-                    stop_index = int(np.flatnonzero(np.isclose(theta, stop, atol=1e-10))[0])
+                    start_index = int(np.flatnonzero(np.isclose(theta, start, atol=1e-8))[0])
+                    stop_index = int(np.flatnonzero(np.isclose(theta, stop, atol=1e-8))[0])
                     segment_ranges.append((f"{pair['name']}_{segment_name}", start_index, stop_index))
                 if len(segment_ranges) == 1 and segment_ranges[0][1:] == (0, len(theta) - 1):
                     full_segment_name = segment_ranges[0][0]
@@ -542,7 +667,7 @@ class Assembly(cq.Assembly):
                         )
                     )
                 cell_index += 1
-        return meshes
+        return self._name_split_blanket_meshes(meshes, data)
 
     def _mesh_structured_angular_partition(self, data, theta, phi, n_radial, full_torus):
         """Mesh blanket/divertor cells on shared poloidal and offset-plane toroidal grids."""
@@ -578,17 +703,25 @@ class Assembly(cq.Assembly):
         for curve in radial_curves:
             if not any(np.allclose(curve, existing, rtol=0.0, atol=1e-8) for existing in unique_curves):
                 unique_curves.append(np.asarray(curve, dtype=float))
-        unique_curves.sort(key=lambda curve: float(np.mean(curve)))
-        for lower, upper in zip(unique_curves[:-1], unique_curves[1:]):
-            if np.any(upper - lower <= 1e-8):
-                raise ValueError("radial layer interfaces cross or touch on the structured mesh")
+        # Blanket interfaces may exchange radial order around the poloidal
+        # profile, and divertor interfaces intentionally cross blanket
+        # interfaces because divertor cells replace blanket cells locally.
+        # Keep the shared radial grid ordered at every poloidal node, as in
+        # _mesh_structured_layers_with_divertors, instead of requiring one
+        # global ordering for the full profiles.
+        ordered_offsets = np.sort(np.stack(unique_curves), axis=0)
+        # Avoid zero-volume cells where interfaces meet at a sampled node.
+        for index in range(1, len(ordered_offsets)):
+            ordered_offsets[index] = np.maximum(
+                ordered_offsets[index], ordered_offsets[index - 1] + 1e-9
+            )
 
         radial_nodes = []
-        for lower, upper in zip(unique_curves[:-1], unique_curves[1:]):
+        for lower, upper in zip(ordered_offsets[:-1], ordered_offsets[1:]):
             for subdivision in range(n_radial):
                 fraction = subdivision / n_radial
                 radial_nodes.append(lower + fraction * (upper - lower))
-        radial_nodes.append(unique_curves[-1])
+        radial_nodes.append(ordered_offsets[-1])
         radial_nodes = np.asarray(radial_nodes)
 
         geometry_r = np.empty_like(radial_nodes)
@@ -671,20 +804,26 @@ class Assembly(cq.Assembly):
             # Order their intersections at each node to keep angular cells
             # from becoming inverted where the curves cross.
             boundary_values = list(np.sort(np.stack(boundary_values), axis=0))
+            # Intersections can make neighboring boundaries coincide at a
+            # sampled node. Keep a negligible positive width there so the
+            # structured mesh does not contain zero-width toroidal cells.
+            for index in range(1, len(boundary_values)):
+                boundary_values[index] = np.maximum(
+                    boundary_values[index], boundary_values[index - 1] + 1e-10
+                )
         else:
             order = np.argsort([float(np.mean(values)) for values in boundary_values])
             boundary_values = [boundary_values[index] for index in order]
-
-        for boundary_index, (lower, upper) in enumerate(zip(boundary_values[:-1], boundary_values[1:])):
-            separation = upper - lower
-            if np.any(separation <= 1e-10):
-                minimum = float(np.min(separation))
-                location = np.unravel_index(int(np.argmin(separation)), separation.shape)
-                raise ValueError(
-                    "toroidal sector boundaries cross or touch on the structured grid "
-                    f"between curves {boundary_index} and {boundary_index + 1} "
-                    f"(minimum separation {minimum:.3g} radians at grid node {location})"
-                )
+            for boundary_index, (lower, upper) in enumerate(zip(boundary_values[:-1], boundary_values[1:])):
+                separation = upper - lower
+                if np.any(separation <= 1e-10):
+                    minimum = float(np.min(separation))
+                    location = np.unravel_index(int(np.argmin(separation)), separation.shape)
+                    raise ValueError(
+                        "toroidal sector boundaries cross or touch on the structured grid "
+                        f"between curves {boundary_index} and {boundary_index + 1} "
+                        f"(minimum separation {minimum:.3g} radians at grid node {location})"
+                    )
 
         # Allocate the requested toroidal resolution across the shared angular
         # intervals while preserving every sector/gap boundary.
@@ -855,6 +994,16 @@ class Assembly(cq.Assembly):
                                         material_name = f"{base_name}_{sector_name}"
                                         break
                             break
+                    if material_name is not None and any(
+                        material_name == cut_record["layer_name"]
+                        and angle_in_range(
+                            theta_center_degrees,
+                            cut_record["poloidal_start_angle"],
+                            cut_record["poloidal_extent_angle"],
+                        )
+                        for cut_record in data.get("poloidal_cuts", ())
+                    ):
+                        material_name = None
                     labels[radial_index, theta_index, phi_index] = material_name
 
         # Split the labeled hexahedra into connected volume components before
@@ -930,7 +1079,8 @@ class Assembly(cq.Assembly):
                     ),
                 }
             )
-        return components
+
+        return self._name_split_blanket_meshes(components, data)
 
     def export_structured_layers_exodus(
         self,
@@ -940,14 +1090,17 @@ class Assembly(cq.Assembly):
         n_radial=1,
         n_axial=None,
         coil_mesh_size=10.0,
+        include_added_components=True,
         tag_names=None,
+        volume_meshes=None,
     ):
         """Write the generated tokamak blanket tetrahedral mesh to Exodus.
 
         The Exodus element blocks use the Paramak layer, poloidal segment, or
         center-column names. Added CAD components such as coils are
-        tetrahedralized with Gmsh using ``coil_mesh_size``. Requires the
-        optional ``netCDF4`` and ``gmsh`` packages. ``tag_names`` maps mesh
+        tetrahedralized with Gmsh when ``include_added_components=True``.
+        Requires the optional ``netCDF4`` package and Gmsh when those
+        components are included. ``tag_names`` maps mesh
         names to Exodus block names and can combine multiple meshes into one
         block. Geometry units are Paramak's centimetres.
         """
@@ -957,16 +1110,49 @@ class Assembly(cq.Assembly):
             write_tetrahedral_mesh_exodus,
         )
 
-        meshes = self.mesh_structured_layer_volumes(
-            n_poloidal=n_poloidal,
-            n_toroidal=n_toroidal,
-            n_radial=n_radial,
-            n_axial=n_axial,
-            coil_mesh_size=coil_mesh_size,
-        )
-        meshes = remap_mesh_names(meshes, tag_names)
+        if volume_meshes is None:
+            volume_meshes = self.mesh_structured_layer_volumes(
+                n_poloidal=n_poloidal,
+                n_toroidal=n_toroidal,
+                n_radial=n_radial,
+                n_axial=n_axial,
+                include_added_components=include_added_components,
+                coil_mesh_size=coil_mesh_size,
+            )
+        meshes = remap_mesh_names(volume_meshes, tag_names)
         vertices, connectivity, blocks = merge_tetrahedral_meshes(meshes)
         return write_tetrahedral_mesh_exodus(vertices, connectivity, blocks, filename)
+
+    def export_structured_volume_mesh_h5m(
+        self,
+        filename,
+        n_poloidal=128,
+        n_toroidal=32,
+        n_radial=1,
+        n_axial=None,
+        coil_mesh_size=10.0,
+        include_added_components=True,
+        tag_names=None,
+        volume_meshes=None,
+    ):
+        """Write the tetrahedral volume mesh to a generic MOAB H5M file.
+
+        Unlike :meth:`create_structured_layer_dagmc_model`, this preserves
+        tetrahedral volume elements instead of extracting triangular boundary
+        surfaces. The resulting H5M is not a DAGMC geometry file.
+        """
+        from ..workplanes.structured_mesh import write_tetrahedral_mesh_h5m
+
+        if volume_meshes is None:
+            volume_meshes = self.mesh_structured_layer_volumes(
+                n_poloidal=n_poloidal,
+                n_toroidal=n_toroidal,
+                n_radial=n_radial,
+                n_axial=n_axial,
+                include_added_components=include_added_components,
+                coil_mesh_size=coil_mesh_size,
+            )
+        return write_tetrahedral_mesh_h5m(volume_meshes, filename, tag_names=tag_names)
 
     def remove(self, name: str):
         new_assembly = Assembly()
@@ -1018,6 +1204,19 @@ class Assembly(cq.Assembly):
             plasma_facing_offset=self.plasma_facing_offset,
             rotation_angle=self.rotation_angle,
         )
+        cut_layers = divertor(
+            poloidal_start_angle=poloidal_start_angle,
+            poloidal_extent_angle=poloidal_extent_angle,
+            divertor_layer_names=divertor_layer_names,
+            divertor_layer_thicknesses=divertor_layer_thicknesses,
+            major_radius=self.major_radius,
+            minor_radius=self.minor_radius,
+            triangularity=self.triangularity,
+            elongation=self.elongation,
+            plasma_facing_offset=self.plasma_facing_offset,
+            rotation_angle=self.rotation_angle,
+            _cut_overlap=1e-3,
+        )
         names = self.names()
         new_names = list(divertor_layer_names)
         duplicates = set(names).intersection(new_names)
@@ -1030,8 +1229,19 @@ class Assembly(cq.Assembly):
             name = full_path.split("/")[-1]
             if name in self.blanket_layer_names and isinstance(obj, cq.Shape):
                 original_solid_count = len(obj.Solids())
-                for layer in layers:
-                    obj = obj.cut(layer.val())
+                for layer in cut_layers:
+                    cutter = layer.val()
+                    try:
+                        overlap_volume = obj.intersect(cutter).Volume()
+                    except ValueError as error:
+                        # CadQuery/OCC returns a null shape when disjoint solids
+                        # are intersected. Such a pair has nothing to subtract.
+                        if "Null TopoDS_Shape object" not in str(error):
+                            raise
+                        continue
+                    if overlap_volume <= 1e-8:
+                        continue
+                    obj = obj.cut(cutter)
                 solids = obj.Solids()
                 if original_solid_count == 1 and len(solids) == 2:
                     radial_order = sorted(
@@ -1065,6 +1275,105 @@ class Assembly(cq.Assembly):
                 }
             )
             structured_data["divertors"] = divertors
+            result.structured_layer_data = structured_data
+        else:
+            result.structured_layer_data = None
+        result.blanket_layer_names = tuple(cuttable_layer_names)
+        return result
+
+    def cut_layers(self, poloidal_start_angle, cut_thickness, layer_names):
+        """Return a copy with a narrow poloidal slice removed from named layers.
+
+        ``poloidal_start_angle`` is measured counter-clockwise from the
+        outboard midplane, in degrees. ``cut_thickness`` is the arc length in
+        centimetres at the outermost radius of each selected layer. The cut
+        extends radially from the plasma centre through that layer and around
+        the model's full toroidal extent.
+
+        The cut is also recorded in structured layer metadata so the
+        structured tetrahedral mesh omits the same poloidal interval.
+        """
+        if self.major_radius is None or self.minor_radius is None:
+            raise ValueError("cut_layers() requires a Paramak tokamak model")
+        if not isinstance(cut_thickness, (int, float)) or cut_thickness <= 0:
+            raise ValueError("cut_thickness must be a positive number of centimetres")
+        selected = set(layer_names)
+        available = set(self.names())
+        missing = selected - available
+        if missing:
+            raise ValueError(f"Layer names not found in the model: {sorted(missing)}")
+
+        result = Assembly()
+        cuttable_layer_names = list(self.blanket_layer_names)
+        poloidal_cuts = []
+        angle_start = float(poloidal_start_angle) % 360.0
+        for obj, full_path, loc, color in self:
+            name = full_path.split("/")[-1]
+            if name not in selected or not isinstance(obj, cq.Shape):
+                result.add(obj, name=name, color=color, loc=loc)
+                continue
+
+            points = [vertex.Center() for vertex in obj.Vertices()]
+            outer_radius = max(
+                (
+                    math.hypot(math.hypot(point.x, point.y) - self.major_radius, point.z)
+                    for point in points
+                ),
+                default=self.minor_radius,
+            )
+            outer_radius = max(outer_radius, self.minor_radius)
+            angular_extent = min(359.999, math.degrees(cut_thickness / outer_radius))
+            angle_end = angle_start + angular_extent
+            poloidal_cuts.append(
+                {
+                    "layer_name": name,
+                    "poloidal_start_angle": angle_start,
+                    "poloidal_extent_angle": angular_extent,
+                }
+            )
+            # A triangular radial wedge in the R-Z plane, revolved around the
+            # machine axis. Its outer arc has the requested physical width.
+            def point(radius, angle):
+                radians = math.radians(angle)
+                return (self.major_radius + radius * math.cos(radians), radius * math.sin(radians))
+
+            cutter = (
+                cq.Workplane("XZ")
+                .polyline(
+                    [
+                        (self.major_radius, 0),
+                        point(outer_radius * 1.01, angle_start),
+                        point(outer_radius * 1.01, angle_end),
+                    ]
+                )
+                .close()
+                .revolve(self.rotation_angle or 360.0)
+                .val()
+            )
+            cut_shape = obj.cut(cutter)
+            cut_solids = cut_shape.Solids()
+            if len(cut_solids) == 2:
+                radial_order = sorted(
+                    cut_solids,
+                    key=lambda solid: math.hypot(solid.Center().x, solid.Center().y),
+                )
+                inboard_name = f"{name}_inboard"
+                outboard_name = f"{name}_outboard"
+                result.add(radial_order[0], name=inboard_name, color=color, loc=loc)
+                result.add(radial_order[1], name=outboard_name, color=color, loc=loc)
+                if name in cuttable_layer_names:
+                    cuttable_layer_names.remove(name)
+                    cuttable_layer_names.extend((inboard_name, outboard_name))
+            else:
+                result.add(cut_shape, name=name, color=color, loc=loc)
+
+        self._copy_metadata(result)
+        if self.structured_layer_data is not None:
+            structured_data = dict(self.structured_layer_data)
+            structured_data["poloidal_cuts"] = [
+                *structured_data.get("poloidal_cuts", ()),
+                *poloidal_cuts,
+            ]
             result.structured_layer_data = structured_data
         else:
             result.structured_layer_data = None

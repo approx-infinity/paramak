@@ -507,6 +507,67 @@ def write_tetrahedral_mesh_exodus(vertices, connectivity, blocks, exodus_filenam
     return exodus_filename
 
 
+def write_tetrahedral_mesh_h5m(meshes, h5m_filename, tag_names=None):
+    """Write named tetrahedral volume elements to a generic MOAB H5M file.
+
+    This writes the tetrahedra themselves as ``MBTET`` elements and groups
+    them into named material sets. The result is a volume-mesh H5M, not a
+    DAGMC geometry file; use :func:`dagmc_model_from_structured_meshes` for
+    the DAGMC surface representation.
+
+    PyMOAB is imported only when this function is called. Coordinates are
+    stored in Paramak's centimetre units.
+    """
+    try:
+        from pymoab import core, types
+    except ImportError as error:
+        raise ImportError("PyMOAB is required to write a tetrahedral H5M file") from error
+
+    vertices, connectivity, blocks = merge_tetrahedral_meshes(
+        remap_mesh_names(meshes, tag_names)
+    )
+    tet_points = vertices[connectivity]
+    signed_jacobians = np.einsum(
+        "ij,ij->i",
+        tet_points[:, 1] - tet_points[:, 0],
+        np.cross(tet_points[:, 2] - tet_points[:, 0], tet_points[:, 3] - tet_points[:, 0]),
+    )
+    if not np.all(np.isfinite(signed_jacobians)) or np.any(signed_jacobians == 0.0):
+        raise ValueError("tetrahedral mesh contains degenerate or invalid elements")
+    negative = signed_jacobians < 0.0
+    connectivity[negative] = connectivity[negative][:, [0, 1, 3, 2]]
+
+    moab = core.Core()
+    moab_vertices = moab.create_vertices(
+        np.ascontiguousarray(vertices, dtype=np.float64)
+    ).to_array()
+    tetrahedra = moab.create_elements(
+        types.MBTET,
+        moab_vertices[np.asarray(connectivity, dtype=np.int32)],
+    ).to_array()
+
+    max_name_length = max(32, max(len(name.encode("utf-8")) + 1 for name in blocks))
+    name_tag = moab.tag_get_handle(
+        "NAME", max_name_length, types.MB_TYPE_OPAQUE, types.MB_TAG_SPARSE, True
+    )
+    category_tag = moab.tag_get_handle(
+        "CATEGORY", 32, types.MB_TYPE_OPAQUE, types.MB_TAG_SPARSE, True
+    )
+    material_set_tag = moab.tag_get_handle(
+        "MATERIAL_SET", 1, types.MB_TYPE_INTEGER, types.MB_TAG_SPARSE, True
+    )
+
+    for material_set_id, (name, element_indices) in enumerate(blocks.items(), start=1):
+        meshset = moab.create_meshset()
+        moab.add_entities(meshset, tetrahedra[element_indices])
+        moab.tag_set_data(name_tag, [meshset], [name])
+        moab.tag_set_data(category_tag, [meshset], ["Material"])
+        moab.tag_set_data(material_set_tag, [meshset], [material_set_id])
+
+    moab.write_file(str(h5m_filename))
+    return h5m_filename
+
+
 def mesh_revolved_layer(
     inner_profile,
     outer_profile,
@@ -779,7 +840,10 @@ def tetrahedralize_cad_solid(solid, name, mesh_size=10.0):
     try:
         gmsh.option.setNumber("General.Terminal", 0)
         gmsh.option.setNumber("Mesh.ElementOrder", 1)
-        gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_size)
+        # Permit refinement below the requested target to resolve thin CAD
+        # features (e.g. WCLL armor) instead of forcing every edge to the
+        # same length as the bulk mesh size.
+        gmsh.option.setNumber("Mesh.MeshSizeMin", max(mesh_size * 0.005, 1e-6))
         gmsh.option.setNumber("Mesh.MeshSizeMax", mesh_size)
         gmsh.model.add(model_name)
         with tempfile.TemporaryDirectory() as directory:
@@ -787,7 +851,25 @@ def tetrahedralize_cad_solid(solid, name, mesh_size=10.0):
             cq.exporters.export(solid, str(step_file), exportType="STEP")
             gmsh.model.occ.importShapes(str(step_file))
             gmsh.model.occ.synchronize()
-            gmsh.model.mesh.generate(3)
+            meshing_errors = []
+            for algorithm in (1, 4, 10):
+                gmsh.model.mesh.clear()
+                gmsh.option.setNumber("Mesh.Algorithm3D", algorithm)
+                try:
+                    gmsh.model.mesh.generate(3)
+                    break
+                except Exception as error:
+                    meshing_errors.append((algorithm, error))
+            else:
+                algorithm_names = {1: "Delaunay", 4: "Frontal", 10: "HXT"}
+                attempts = ", ".join(
+                    f"{algorithm_names[algorithm]}: {error}"
+                    for algorithm, error in meshing_errors
+                )
+                raise ValueError(
+                    f"Gmsh could not tetrahedralize CAD component {name!r}; "
+                    f"meshing attempts failed ({attempts})"
+                ) from meshing_errors[-1][1]
             node_tags, coordinates, _ = gmsh.model.mesh.getNodes()
             points = coordinates.reshape((-1, 3))
             node_index = {int(tag): index for index, tag in enumerate(node_tags)}
